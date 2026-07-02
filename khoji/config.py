@@ -1,0 +1,48 @@
+"""Khoji settings — the single source for model ids, paths, and retrieval knobs.
+
+Both phases import from here: `ingest.py` writes the vector store, `server.py`
+reads it. Keeping this in one place is what lets ingestion and serving stay
+decoupled around the Chroma seam.
+
+Everything has an offline-sane default; override via environment variables
+(e.g. OLLAMA_HOST) without touching code.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Repo root = parent of this package dir. Paths below hang off it so the app
+# runs the same regardless of the current working directory.
+ROOT = Path(__file__).resolve().parent.parent
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="KHOJI_", env_file=".env", extra="ignore")
+
+    # --- Ollama / models (all served locally; both already pulled) ---
+    ollama_host: str = "http://localhost:11434"
+    gen_model: str = "phi3.5:3.8b"        # default generator, per the brief
+    bench_model: str = "qwen2.5:3b"       # honest benchmark foil (see IMPROVEMENTS.md)
+    embed_model: str = "nomic-embed-text"  # ingestion + query embeddings
+
+    # --- Storage (created on demand; both gitignored) ---
+    raw_dir: Path = ROOT / "data" / "raw"        # source NCERT PDFs live here
+    chroma_dir: Path = ROOT / "data" / "chroma"  # persisted vector store
+    collection: str = "ncert"
+
+    # --- Retrieval / chunking (tuned during the Session-2 ingestion spike) ---
+    top_k: int = 4
+    chunk_size: int = 1000
+    chunk_overlap: int = 150
+
+    def ensure_dirs(self) -> None:
+        """Make the data dirs exist so a fresh clone works with no setup."""
+        self.raw_dir.mkdir(parents=True, exist_ok=True)
+        self.chroma_dir.mkdir(parents=True, exist_ok=True)
+
+
+settings = Settings()

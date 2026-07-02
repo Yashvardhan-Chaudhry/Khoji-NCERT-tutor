@@ -1,0 +1,24 @@
+# --- Dynamic working docs: kept local, not published ---
+# These are the live control/decision docs for the author + Claude. A polished
+# public claude.md is added later, deliberately.
+claude.md
+DECISIONS.md
+IMPROVEMENTS.md
+docs/
+
+# --- Data: NCERT PDFs (copyright) + the vector store (bulky, regenerable) ---
+data/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

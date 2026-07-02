@@ -1,0 +1,19 @@
+# Khoji — pinned to major lines; all open-source, all runs offline once models are pulled.
+
+# Serving
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+
+# Ingestion plumbing (LangChain used here only)
+langchain
+langchain-community
+langchain-text-splitters
+langchain-ollama
+langchain-chroma
+pymupdf
+
+# Vector store + local model client (used directly on the serving side)
+chromadb
+ollama
