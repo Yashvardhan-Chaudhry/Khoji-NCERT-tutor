@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import chromadb
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
@@ -33,16 +34,29 @@ def _embeddings() -> OllamaEmbeddings:
     return OllamaEmbeddings(model=settings.embed_model, base_url=settings.ollama_host)
 
 
-def ingest_pdf(pdf: Path, subject: str, klass: str, chapter: str | None = None) -> int:
+def ingest_pdf(pdf: Path, subject: str, klass: str, chapter: str | None = None,
+               reset: bool = False) -> int:
     """Load one PDF into the Chroma store. Returns the number of chunks written.
 
     Every chunk keeps enough metadata to build an honest citation later:
     subject, class, chapter (optional), 1-indexed page, and source filename.
+
+    `reset=True` clears the collection first — ingest otherwise *appends*, so
+    re-ingesting the same chapter would silently duplicate chunks.
     """
     if not pdf.exists():
         raise FileNotFoundError(f"PDF not found: {pdf}")
 
     settings.ensure_dirs()
+
+    # One shared client so the optional reset and the write don't open two
+    # PersistentClients on the same path.
+    client = chromadb.PersistentClient(path=str(settings.chroma_dir))
+    if reset:
+        try:
+            client.delete_collection(settings.collection)
+        except Exception:
+            pass  # nothing to reset yet
 
     # One Document per page; PyMuPDF fills metadata['page'] (0-indexed) + 'source'.
     pages = PyMuPDFLoader(str(pdf)).load()
@@ -65,7 +79,8 @@ def ingest_pdf(pdf: Path, subject: str, klass: str, chapter: str | None = None) 
     store = Chroma(
         collection_name=settings.collection,
         embedding_function=_embeddings(),
-        persist_directory=str(settings.chroma_dir),
+        client=client,
+        collection_metadata={"hnsw:space": "cosine"},  # meaningful 0-1 similarity scores
     )
     store.add_documents(chunks)
 
@@ -78,9 +93,11 @@ def main() -> None:
     ap.add_argument("--subject", required=True, help="e.g. science, math, history")
     ap.add_argument("--klass", required=True, help="Class number, e.g. 8 (V-XII)")
     ap.add_argument("--chapter", default=None, help="Optional chapter name for citations")
+    ap.add_argument("--reset", action="store_true",
+                    help="Clear the collection first (avoids duplicate chunks on re-ingest)")
     args = ap.parse_args()
 
-    n = ingest_pdf(args.pdf, args.subject, args.klass, args.chapter)
+    n = ingest_pdf(args.pdf, args.subject, args.klass, args.chapter, reset=args.reset)
     print(f"Ingested {n} chunks from {args.pdf.name} "
           f"(subject={args.subject}, class={args.klass}) -> {settings.chroma_dir}")
 

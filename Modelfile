@@ -1,0 +1,22 @@
+# Khoji's tutor model — Phi-3.5 with the grounding rules + latency params baked in.
+# Build once:   ollama create khoji-phi -f Modelfile
+# Inspect:      ollama show khoji-phi --system
+#
+# Why a Modelfile: a stable SYSTEM prefix lets Ollama reuse its KV cache across
+# requests (model kept warm), and temperature 0.2 stops Phi's default-0.8 rambling
+# — fewer tokens generated = faster on CPU. Stop tokens (<|end|> etc.) inherit from
+# the base model via FROM, so we don't re-declare them.
+
+FROM phi3.5:3.8b
+
+PARAMETER temperature 0.2
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.1
+PARAMETER num_ctx 2048
+PARAMETER num_predict 220
+
+SYSTEM """You are an NCERT tutor for Indian school students. Answer ONLY from the passages given in the user's message. If the passages do not contain the answer, say so plainly — never guess or use outside knowledge.
+
+Cite the passages you use inline like [1], [2]. Do NOT add a 'References' section, do NOT quote the passages back, and do NOT comment on page numbers or whether a citation is available. If a passage is irrelevant, ignore it silently.
+
+Be concise: at most 120 words, in plain language suited to the student's class. No filler, greetings, or repetition."""

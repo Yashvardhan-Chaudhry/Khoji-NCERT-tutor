@@ -46,31 +46,52 @@ ollama pull phi3.5:3.8b
 ollama pull nomic-embed-text
 ```
 
+Build the tutor model once — bakes the grounding rules + tuned params (low
+temperature, capped length) into a `khoji-phi` model for consistent, faster answers:
+
+```bash
+ollama create khoji-phi -f Modelfile
+```
+
 Install and run:
 
 ```bash
 pip install -r requirements.txt
 
-# 1. Ingest a NCERT PDF (drop your PDFs in data/raw/)
-python -m khoji.ingest --pdf data/raw/science_viii.pdf --subject science --klass 8
+# 1. Ingest a NCERT PDF (drop your PDFs in data/raw/). --reset clears the
+#    collection first so re-ingesting doesn't duplicate chunks.
+python -m khoji.ingest --pdf data/raw/science_ix.pdf --subject science --klass 9 --chapter "Structure of the Atom" --reset
 
-# 2. Serve
+# 2. Serve (run at --log-level info to see per-request timings)
 uvicorn khoji.server:app --reload
 ```
 
-Ask a question:
+Ask a question — the bundled client streams the answer and prints timings:
 
 ```bash
+python -m khoji.ask "What is photosynthesis?" --session s1
+# or plain HTTP:
 curl -s localhost:8000/ask -H 'content-type: application/json' \
   -d '{"question":"What is photosynthesis?","session_id":"s1"}'
 ```
+
+The grounded answer uses `khoji-phi` (override with `KHOJI_TUTOR_MODEL`); the
+follow-up rewrite uses base `phi3.5:3.8b`.
 
 The response is a UI-agnostic JSON contract — `answer`, `sources`
 (subject/class/chapter/page), `timings`, `model`, `persona_applied`, and
 `rewritten_question` when a follow-up was resolved from session context.
 
+For a live, streaming answer with time-to-first-token in seconds, use the
+bundled client (or `POST /ask/stream` directly):
+
+```bash
+python -m khoji.ask "What is an electron?" --session s1
+```
+
 ## Status
 
-Early scaffold — the pipeline runs end-to-end; retrieval quality is being tuned
-against a real NCERT corpus. A benchmark (Phi-3.5 vs Qwen2.5) and a chat frontend
-are on the roadmap.
+Runs end-to-end on real NCERT content with grounded, cited answers, streaming
+(`/ask/stream`), conversational follow-ups (query rewrite), and cosine-scored
+retrieval with a relevance floor. A model benchmark (Phi-3.5 vs Qwen2.5), a
+persona voice layer, and a chat frontend are on the roadmap.

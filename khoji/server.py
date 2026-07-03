@@ -18,16 +18,32 @@ Boot:  uvicorn khoji.server:app --reload
 
 from __future__ import annotations
 
+import json
+import logging
+import re
 import time
 from collections import defaultdict
+from contextlib import asynccontextmanager
+from datetime import datetime
 
 import chromadb
 import ollama
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from khoji import persona
 from khoji.config import settings
+
+# Dedicated logger so per-request timing lines show in the terminal regardless of
+# uvicorn's --log-level. One line per request; the full record goes to EVAL.md.
+log = logging.getLogger("khoji")
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s khoji | %(message)s", "%H:%M:%S"))
+    log.addHandler(_h)
+    log.setLevel(logging.INFO)
+    log.propagate = False
 
 # --- Frozen JSON contract (UI-agnostic: React or Streamlit consume the same) ---
 
@@ -51,7 +67,7 @@ class Timings(BaseModel):
 class AskRequest(BaseModel):
     question: str
     session_id: str | None = None
-    persona: bool = True
+    persona: bool = False  # opt-in: the re-voice is a second LLM pass (slow on CPU)
 
 
 class AskResponse(BaseModel):
@@ -68,34 +84,131 @@ class AskResponse(BaseModel):
 _ollama = ollama.Client(host=settings.ollama_host)
 _chroma = chromadb.PersistentClient(path=str(settings.chroma_dir))
 
+# Ollama generation options — the latency knobs (see config.py). num_ctx shrinks
+# the KV cache (RAM), num_predict caps output length (the dominant cost on CPU).
+_OPTS = {"num_predict": settings.num_predict, "num_ctx": settings.num_ctx}
+# Rewrite is deterministic + hard-capped so it can't ramble into a bloated question.
+_REWRITE_OPTS = {"num_predict": 48, "num_ctx": settings.num_ctx, "temperature": 0.0}
+
+# Cheap signals that a question depends on earlier turns (English + common Hinglish).
+_FOLLOWUP_CUES = re.compile(
+    r"\b(it|its|this|that|these|those|them|they|he|she|his|her|their|"
+    r"iska|iske|isko|uska|uske|usko|inka|unka|yeh|woh|iss|uss)\b",
+    re.IGNORECASE,
+)
+_FOLLOWUP_START = re.compile(r"^(and|so|but|also|what about|how about|why|why not|then)\b", re.IGNORECASE)
+
 # session_id -> recent [{"q":..., "a":...}] turns; process-local, cleared on restart.
 SESSIONS: dict[str, list[dict]] = defaultdict(list)
 _MAX_HISTORY = 6
 
-app = FastAPI(title="Khoji — NCERT tutor", version="0.1.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Readiness log + optional warm-up so the first real query isn't cold-loaded.
+    n = _corpus_count()
+    if n:
+        log.info("corpus ready: %d chunks in '%s'", n, settings.collection)
+    else:
+        log.warning("no corpus ingested — run `python -m khoji.ingest` before serving")
+    if settings.warmup and n:
+        try:
+            _ollama.chat(model=settings.tutor_model,
+                         messages=[{"role": "user", "content": "ok"}],
+                         options={"num_predict": 1}, keep_alive=settings.keep_alive)
+            _embed("warmup")
+            log.info("warmed up %s + %s", settings.tutor_model, settings.embed_model)
+        except Exception as e:  # warm-up is best-effort; serving still works cold
+            log.warning("warmup skipped: %s", e)
+    yield
+
+
+app = FastAPI(title="Khoji — NCERT tutor", version="0.1.0", lifespan=lifespan)
+
+
+def _corpus_count() -> int:
+    try:
+        return _chroma.get_collection(settings.collection).count()
+    except Exception:
+        return 0
+
+
+def _meta(resp) -> dict:
+    """Exact token-level metrics from an Ollama response (durations are ns).
+
+    Works whether ollama-python hands back a dict or a ChatResponse object.
+    The final chunk of a streamed response carries these same fields.
+    """
+    g = resp.get if isinstance(resp, dict) else (lambda k, d=None: getattr(resp, k, d))
+    ec = g("eval_count", 0) or 0            # output tokens
+    ed = g("eval_duration", 0) or 0         # generation time, ns
+    pc = g("prompt_eval_count", 0) or 0     # prompt tokens actually processed
+    ld = g("load_duration", 0) or 0         # model load time, ns (big = cold)
+    return {
+        "prompt_tokens": pc,
+        "output_tokens": ec,
+        "tok_per_s": round(ec / (ed / 1e9), 2) if ed else 0.0,
+        "gen_ms": round(ed / 1e6, 1),
+        "load_ms": round(ld / 1e6, 1),
+    }
 
 
 def _embed(text: str) -> list[float]:
     return _ollama.embeddings(model=settings.embed_model, prompt=text)["embedding"]
 
 
-def _rewrite(question: str, history: list[dict]) -> str:
-    """Turn a context-dependent follow-up into a standalone question.
+def _needs_rewrite(question: str, history: list[dict]) -> bool:
+    """Gate: rewrite ONLY genuine context-dependent follow-ups (cheap, no LLM).
 
-    No history -> return as-is. This is what makes conversational context work
-    without polluting retrieval: we retrieve on the resolved standalone form.
+    Standalone questions ("What is an electron?") pass through untouched — that's
+    the common case and was the source of the old over-rewriting: needless bloat
+    and a wasted 13-25s LLM call every turn.
     """
     if not history:
+        return False
+    q = question.strip()
+    if len(q.split()) <= 2:               # "why?", "and protons?"
+        return True
+    if _FOLLOWUP_START.search(q):         # "and what about neutrons"
+        return True
+    return bool(_FOLLOWUP_CUES.search(q))  # contains a pronoun / deictic reference
+
+
+def _rewrite(question: str, history: list[dict]) -> str:
+    """Resolve a follow-up into a standalone question — only when gated in.
+
+    We retrieve on the resolved form so the vector search gets a self-contained
+    query. Kept minimal: temperature 0 + a hard cap, using the recent *questions*
+    (not answers) for the antecedent so the model can't latch onto an unrelated
+    noun from a previous answer. Any empty/runaway rewrite falls back to original.
+    """
+    if not _needs_rewrite(question, history):
         return question
-    convo = "\n".join(f"Student: {t['q']}\nKhoji: {t['a']}" for t in history[-3:])
+    convo = "\n".join(f"Q: {t['q']}" for t in history[-2:])
     prompt = (
-        "Rewrite the student's latest message into a single standalone question "
-        "that makes sense without the earlier conversation. Resolve pronouns and "
-        "references like 'iska', 'that', 'it'. Reply with ONLY the rewritten "
-        f"question, nothing else.\n\nConversation:\n{convo}\n\nLatest: {question}"
+        "Rewrite the follow-up into a standalone question by replacing references "
+        "(it, this, that, iska, ...) with the specific topic from the recent "
+        "questions. Output ONLY the rewritten question on one line — no explanation, "
+        f"no added facts.\n\nRecent questions:\n{convo}\n\nFollow-up: {question}\n"
+        "Standalone question:"
     )
-    resp = _ollama.chat(model=settings.gen_model, messages=[{"role": "user", "content": prompt}])
-    return resp["message"]["content"].strip() or question
+    # Reuse the already-loaded tutor model with a system override — NOT base
+    # phi3.5, which is a different model name and would load a 2nd ~3.9GB copy
+    # into RAM (fatal paging on this box). Same weights, one resident model.
+    resp = _ollama.chat(
+        model=settings.tutor_model,
+        messages=[
+            {"role": "system", "content":
+             "You rewrite a student's follow-up into ONE standalone question. "
+             "Output only the rewritten question, nothing else."},
+            {"role": "user", "content": prompt},
+        ],
+        options=_REWRITE_OPTS,
+        keep_alive=settings.keep_alive,
+    )
+    out = resp["message"]["content"].strip().strip('"').strip()
+    if not out or len(out) > 220:  # runaway or empty -> trust the original
+        return question
+    return out
 
 
 def _retrieve(question: str) -> list[Source]:
@@ -107,45 +220,114 @@ def _retrieve(question: str) -> list[Source]:
     docs = res.get("documents", [[]])[0]
     metas = res.get("metadatas", [[]])[0]
     dists = res.get("distances", [[]])[0]
-    sources: list[Source] = []
+    scored: list[Source] = []
     for doc, meta, dist in zip(docs, metas, dists):
         meta = meta or {}
-        sources.append(
+        scored.append(
             Source(
                 subject=meta.get("subject"),
                 klass=meta.get("klass"),
                 chapter=meta.get("chapter"),
                 page=meta.get("page"),
                 snippet=doc[:300],
-                score=round(1.0 / (1.0 + float(dist)), 4),  # distance -> 0..1 similarity
+                score=round(1.0 - float(dist), 4),  # cosine distance -> similarity 0..1
             )
         )
-    return sources
+    # Relevance gate: keep confident matches; refuse-fast if none clear the bar.
+    kept = [s for s in scored if s.score >= settings.min_score]
+    if scored and not kept:
+        log.info("retrieval below threshold (top=%.3f < %.2f) — refusing",
+                 max(s.score for s in scored), settings.min_score)
+    return kept
 
 
-def _generate(question: str, sources: list[Source]) -> str:
-    if not sources:
-        return ("I couldn't find this in the ingested NCERT material, so I won't guess. "
-                "Try rephrasing, or check that the relevant chapter has been ingested.")
+# Shown when retrieval comes back empty — we refuse to guess rather than hallucinate.
+_NO_SOURCES = ("I couldn't find this in the ingested NCERT material, so I won't guess. "
+               "Try rephrasing, or check that the relevant chapter has been ingested.")
+
+
+def _build_prompt(question: str, sources: list[Source]) -> str:
+    """Dynamic user message shared by the blocking and streaming paths.
+
+    Only the changing content lives here (class, passages, question) — the tutor
+    rules are baked into the khoji-phi Modelfile's SYSTEM, so that static prefix
+    stays byte-identical across requests and Ollama can reuse its KV cache.
+    """
     klass = next((s.klass for s in sources if s.klass), None)
     context = "\n\n".join(
         f"[{i}] (subject={s.subject}, class={s.klass}, chapter={s.chapter}, page={s.page})\n{s.snippet}"
         for i, s in enumerate(sources, 1)
     )
-    level = f"a Class {klass} student" if klass else "a school student"
-    prompt = (
-        f"You are an NCERT tutor. Answer the question for {level}, using ONLY the "
-        "passages below. If the passages don't contain the answer, say so plainly "
-        "instead of guessing. Cite the passages you use like [1], [2].\n\n"
-        f"Passages:\n{context}\n\nQuestion: {question}"
+    return f"Student class: {klass or 'unknown'}\n\nPassages:\n{context}\n\nQuestion: {question}"
+
+
+def _generate(question: str, sources: list[Source]) -> tuple[str, dict]:
+    """Grounded answer via the tutor model. Returns (answer, ollama-metrics)."""
+    if not sources:
+        return _NO_SOURCES, {}
+    resp = _ollama.chat(
+        model=settings.tutor_model,
+        messages=[{"role": "user", "content": _build_prompt(question, sources)}],
+        options=_OPTS,
+        keep_alive=settings.keep_alive,
     )
-    resp = _ollama.chat(model=settings.gen_model, messages=[{"role": "user", "content": prompt}])
-    return resp["message"]["content"].strip()
+    return resp["message"]["content"].strip(), _meta(resp)
+
+
+def _log_eval(rec: dict) -> None:
+    """Append one run block to EVAL.md (kept local). Read on demand, not pasted."""
+    if not settings.eval_log:
+        return
+    srcs = "\n".join(
+        f"  - [{i}] {s.get('subject')} cls{s.get('klass')} ch={s.get('chapter')} "
+        f"p{s.get('page')} score={s.get('score')}"
+        for i, s in enumerate(rec["sources"], 1)
+    ) or "  - (none)"
+    block = (
+        f"\n## run — {rec['ts']}  ({rec['endpoint']})\n"
+        f"- **model:** {rec['model']}\n"
+        f"- **question:** {rec['question']}\n"
+        + (f"- **rewritten:** {rec['rewritten']}\n" if rec["rewritten"] else "")
+        + f"- **timings ms:** rewrite={rec['rewrite_ms']} retrieve={rec['retrieve_ms']} "
+        f"generate={rec['generate_ms']} total={rec['total_ms']}\n"
+        f"- **tokens:** prompt={rec['prompt_tokens']} output={rec['output_tokens']} "
+        f"tok/s={rec['tok_per_s']} load_ms={rec['load_ms']}\n"
+        f"- **sources:**\n{srcs}\n"
+        f"- **answer:**\n\n{rec['answer']}\n"
+    )
+    try:
+        with open(settings.eval_path, "a", encoding="utf-8") as f:
+            f.write(block)
+    except Exception:
+        log.warning("could not write eval report to %s", settings.eval_path)
+
+
+def _emit(endpoint: str, question: str, rewritten: str, sources: list[Source],
+          answer: str, timings: "Timings", meta: dict) -> None:
+    """Log a one-line summary to the terminal + append the full record to EVAL.md."""
+    log.info(
+        "%s | rewrite=%.0f retrieve=%.0f generate=%.0f total=%.0f ms | "
+        "prompt_tok=%s out_tok=%s tok/s=%s load=%sms | %d sources",
+        endpoint, timings.rewrite_ms, timings.retrieve_ms, timings.generate_ms,
+        timings.total_ms, meta.get("prompt_tokens"), meta.get("output_tokens"),
+        meta.get("tok_per_s"), meta.get("load_ms"), len(sources),
+    )
+    _log_eval({
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "endpoint": endpoint, "model": settings.tutor_model,
+        "question": question,
+        "rewritten": rewritten if rewritten != question else None,
+        "rewrite_ms": timings.rewrite_ms, "retrieve_ms": timings.retrieve_ms,
+        "generate_ms": timings.generate_ms, "total_ms": timings.total_ms,
+        "prompt_tokens": meta.get("prompt_tokens"), "output_tokens": meta.get("output_tokens"),
+        "tok_per_s": meta.get("tok_per_s"), "load_ms": meta.get("load_ms"),
+        "sources": [s.model_dump() for s in sources], "answer": answer,
+    })
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok", "collection": settings.collection, "chunks": _corpus_count()}
 
 
 @app.post("/ask", response_model=AskResponse)
@@ -160,7 +342,7 @@ def ask(req: AskRequest) -> AskResponse:
     sources = _retrieve(rewritten)
     t3 = time.perf_counter()
 
-    answer = _generate(rewritten, sources)
+    answer, meta = _generate(rewritten, sources)
     t4 = time.perf_counter()
 
     persona_applied = False
@@ -175,16 +357,88 @@ def ask(req: AskRequest) -> AskResponse:
         history.append({"q": req.question, "a": answer})
         del history[:-_MAX_HISTORY]  # keep the tail bounded
 
+    timings = Timings(
+        rewrite_ms=round((t2 - t1) * 1000, 1),
+        retrieve_ms=round((t3 - t2) * 1000, 1),
+        generate_ms=round((t4 - t3) * 1000, 1),
+        total_ms=round((time.perf_counter() - t0) * 1000, 1),
+    )
+    _emit("/ask", req.question, rewritten, sources, answer, timings, meta)
     return AskResponse(
         answer=answer,
         sources=sources,
-        timings=Timings(
+        timings=timings,
+        model=settings.tutor_model,
+        persona_applied=persona_applied,
+        rewritten_question=rewritten if rewritten != req.question else None,
+    )
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.post("/ask/stream")
+def ask_stream(req: AskRequest) -> StreamingResponse:
+    """Server-Sent Events variant: citations arrive first, then tokens stream.
+
+    The point is time-to-first-token — the student sees sources in ~seconds and
+    the answer typing out, instead of staring at a frozen page for minutes.
+    Persona is not applied here (a second pass can't stream cleanly).
+    """
+    def gen():
+        t0 = time.perf_counter()
+        history = SESSIONS[req.session_id] if req.session_id else []
+
+        t1 = time.perf_counter()
+        rewritten = _rewrite(req.question, history)
+        t2 = time.perf_counter()
+        sources = _retrieve(rewritten)
+        t3 = time.perf_counter()
+
+        # 1) meta first — UI renders citations before a single token is generated
+        yield _sse("meta", {
+            "sources": [s.model_dump() for s in sources],
+            "rewritten_question": rewritten if rewritten != req.question else None,
+            "model": settings.tutor_model,
+        })
+
+        # 2) stream the grounded answer token by token
+        parts: list[str] = []
+        meta: dict = {}
+        if not sources:
+            parts.append(_NO_SOURCES)
+            yield _sse("token", {"text": _NO_SOURCES})
+        else:
+            stream = _ollama.chat(
+                model=settings.tutor_model,
+                messages=[{"role": "user", "content": _build_prompt(rewritten, sources)}],
+                options=_OPTS,
+                keep_alive=settings.keep_alive,
+                stream=True,
+            )
+            for chunk in stream:
+                tok = chunk["message"]["content"]
+                if tok:
+                    parts.append(tok)
+                    yield _sse("token", {"text": tok})
+                meta = _meta(chunk)  # final chunk (done=True) carries the metrics
+        answer = "".join(parts).strip()
+        t4 = time.perf_counter()
+
+        if req.session_id:
+            history.append({"q": req.question, "a": answer})
+            del history[:-_MAX_HISTORY]
+
+        timings = Timings(
             rewrite_ms=round((t2 - t1) * 1000, 1),
             retrieve_ms=round((t3 - t2) * 1000, 1),
             generate_ms=round((t4 - t3) * 1000, 1),
             total_ms=round((time.perf_counter() - t0) * 1000, 1),
-        ),
-        model=settings.gen_model,
-        persona_applied=persona_applied,
-        rewritten_question=rewritten if rewritten != req.question else None,
-    )
+        )
+        _emit("/ask/stream", req.question, rewritten, sources, answer, timings, meta)
+
+        # 3) done — timings for the same contract as /ask
+        yield _sse("done", {"timings": timings.model_dump(), "meta": meta})
+
+    return StreamingResponse(gen(), media_type="text/event-stream")

@@ -25,7 +25,8 @@ class Settings(BaseSettings):
 
     # --- Ollama / models (all served locally; both already pulled) ---
     ollama_host: str = "http://localhost:11434"
-    gen_model: str = "phi3.5:3.8b"        # default generator, per the brief
+    gen_model: str = "phi3.5:3.8b"        # base Phi (benchmark ref); serving reuses tutor_model
+    tutor_model: str = "khoji-phi"        # answers AND rewrite: one resident model, SYSTEM overridden per task
     bench_model: str = "qwen2.5:3b"       # honest benchmark foil (see IMPROVEMENTS.md)
     embed_model: str = "nomic-embed-text"  # ingestion + query embeddings
 
@@ -35,9 +36,20 @@ class Settings(BaseSettings):
     collection: str = "ncert"
 
     # --- Retrieval / chunking (tuned during the Session-2 ingestion spike) ---
-    top_k: int = 4
+    top_k: int = 3                # 3 keeps prompts short + answers focused (5 diluted quality)
     chunk_size: int = 1000
     chunk_overlap: int = 150
+    min_score: float = 0.55       # cosine floor; tunable. atom eval: in-topic ~0.73, off-topic ~0.54
+
+    # --- Inference latency knobs (this box is CPU-only + RAM-starved) ---
+    num_predict: int = 220        # hard ceiling on answer tokens (~120 words + citations)
+    num_ctx: int = 2048           # smaller context = less KV-cache RAM + prompt work
+    keep_alive: str = "10m"       # keep model warm within a session; never "-1" here
+    warmup: bool = True           # preload models on server boot so 1st query isn't cold
+
+    # --- Eval report (server appends one block per request; kept local) ---
+    eval_log: bool = True
+    eval_path: Path = ROOT / "EVAL.md"
 
     def ensure_dirs(self) -> None:
         """Make the data dirs exist so a fresh clone works with no setup."""

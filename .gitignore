@@ -4,6 +4,7 @@
 claude.md
 DECISIONS.md
 IMPROVEMENTS.md
+EVAL.md
 docs/
 
 # --- Data: NCERT PDFs (copyright) + the vector store (bulky, regenerable) ---
