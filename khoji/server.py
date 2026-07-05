@@ -55,6 +55,9 @@ class Source(BaseModel):
     page: int | None = None
     snippet: str
     score: float
+    # internal: passed the min_score gate. exclude=True keeps it out of the public
+    # contract (API/SSE); it's re-added explicitly only in the EVAL record.
+    kept: bool = Field(default=True, exclude=True)
 
 
 class Timings(BaseModel):
@@ -77,6 +80,8 @@ class AskResponse(BaseModel):
     model: str
     persona_applied: bool
     rewritten_question: str | None = None
+    top_score: float | None = None  # best retrieval score seen (even when refused)
+    min_score: float = settings.min_score  # the relevance floor, so a UI can show "how close"
 
 
 # --- Clients + in-session memory (per-session, not long-term user memory) ---
@@ -156,6 +161,27 @@ def _embed(text: str) -> list[float]:
     return _ollama.embeddings(model=settings.embed_model, prompt=text)["embedding"]
 
 
+def _config_fingerprint() -> dict:
+    """The knobs that produced a run — stamped on every eval record so results are
+    attributable to a config (this is what would have caught the L2-vs-cosine mixup)."""
+    space = None
+    try:
+        space = _chroma.get_collection(settings.collection).metadata.get("hnsw:space")
+    except Exception:
+        pass
+    return {
+        "tutor_model": settings.tutor_model,
+        "embed_model": settings.embed_model,
+        "space": space,
+        "top_k": settings.top_k,
+        "min_score": settings.min_score,
+        "num_predict": settings.num_predict,
+        "num_ctx": settings.num_ctx,
+        "chunk_size": settings.chunk_size,
+        "chunk_overlap": settings.chunk_overlap,
+    }
+
+
 def _needs_rewrite(question: str, history: list[dict]) -> bool:
     """Gate: rewrite ONLY genuine context-dependent follow-ups (cheap, no LLM).
 
@@ -212,6 +238,12 @@ def _rewrite(question: str, history: list[dict]) -> str:
 
 
 def _retrieve(question: str) -> list[Source]:
+    """Return ALL top-k candidates (Chroma-sorted), each flagged kept/rejected.
+
+    The relevance gate lives in the `kept` flag (score >= min_score), NOT in the
+    return value: callers use `_passed()` for generation/response, but the full
+    list is logged so refusals aren't a black box (we can see the near-misses).
+    """
     try:
         collection = _chroma.get_collection(settings.collection)
     except Exception:
@@ -223,6 +255,7 @@ def _retrieve(question: str) -> list[Source]:
     scored: list[Source] = []
     for doc, meta, dist in zip(docs, metas, dists):
         meta = meta or {}
+        score = round(1.0 - float(dist), 4)  # cosine distance -> similarity 0..1
         scored.append(
             Source(
                 subject=meta.get("subject"),
@@ -230,15 +263,29 @@ def _retrieve(question: str) -> list[Source]:
                 chapter=meta.get("chapter"),
                 page=meta.get("page"),
                 snippet=doc[:300],
-                score=round(1.0 - float(dist), 4),  # cosine distance -> similarity 0..1
+                score=score,
+                kept=score >= settings.min_score,
             )
         )
-    # Relevance gate: keep confident matches; refuse-fast if none clear the bar.
-    kept = [s for s in scored if s.score >= settings.min_score]
-    if scored and not kept:
+    if scored and not any(s.kept for s in scored):
         log.info("retrieval below threshold (top=%.3f < %.2f) — refusing",
                  max(s.score for s in scored), settings.min_score)
-    return kept
+    return scored
+
+
+def _passed(candidates: list[Source]) -> list[Source]:
+    """The gate: candidates that cleared min_score (used for generation + citation)."""
+    return [s for s in candidates if s.kept]
+
+
+def _public_sources(candidates: list[Source]) -> list[dict]:
+    """Kept sources for the UI/contract — `kept` is auto-excluded (Field exclude=True)."""
+    return [s.model_dump() for s in _passed(candidates)]
+
+
+def _top_score(candidates: list[Source]) -> float | None:
+    """Best retrieval score seen (even if nothing cleared the gate)."""
+    return max((s.score for s in candidates), default=None)
 
 
 # Shown when retrieval comes back empty — we refuse to guess rather than hallucinate.
@@ -262,66 +309,113 @@ def _build_prompt(question: str, sources: list[Source]) -> str:
 
 
 def _generate(question: str, sources: list[Source]) -> tuple[str, dict]:
-    """Grounded answer via the tutor model. Returns (answer, ollama-metrics)."""
+    """Grounded answer via the tutor model. `sources` must already be gated (kept).
+
+    Returns (answer, ollama-metrics). On an Ollama failure the answer is an explicit
+    "<ERROR: ...>" marker and meta carries {"error": ...}, so a broken run is a visible
+    row in EVAL rather than a silent malformed block.
+    """
     if not sources:
         return _NO_SOURCES, {}
-    resp = _ollama.chat(
-        model=settings.tutor_model,
-        messages=[{"role": "user", "content": _build_prompt(question, sources)}],
-        options=_OPTS,
-        keep_alive=settings.keep_alive,
-    )
-    return resp["message"]["content"].strip(), _meta(resp)
+    try:
+        resp = _ollama.chat(
+            model=settings.tutor_model,
+            messages=[{"role": "user", "content": _build_prompt(question, sources)}],
+            options=_OPTS,
+            keep_alive=settings.keep_alive,
+        )
+        return resp["message"]["content"].strip(), _meta(resp)
+    except Exception as e:
+        log.warning("generation failed: %s", e)
+        return f"<ERROR: {e}>", {"error": str(e)}
+
+
+def _oneline(text: str, n: int = 200) -> str:
+    """Whitespace-collapsed, truncated snippet for the retrieval log."""
+    s = " ".join((text or "").split())
+    return s if len(s) <= n else s[:n] + "…"
 
 
 def _log_eval(rec: dict) -> None:
-    """Append one run block to EVAL.md (kept local). Read on demand, not pasted."""
+    """Append the run to EVAL.md (human/Claude-readable) + EVAL.jsonl (machine-parseable).
+
+    The record is intentionally exhaustive — it's the diagnostic surface. Every top-k
+    candidate is logged with its score, kept/rejected flag, and a snippet, so refusals
+    and wrong-chunk retrievals (e.g. a Bohr query pulling Rutherford's bio) are visible.
+    """
     if not settings.eval_log:
         return
-    srcs = "\n".join(
-        f"  - [{i}] {s.get('subject')} cls{s.get('klass')} ch={s.get('chapter')} "
-        f"p{s.get('page')} score={s.get('score')}"
-        for i, s in enumerate(rec["sources"], 1)
-    ) or "  - (none)"
+    cfg = rec["config"]
+    cfg_line = (f"tutor={cfg['tutor_model']} embed={cfg['embed_model']} space={cfg['space']} "
+                f"top_k={cfg['top_k']} min_score={cfg['min_score']} "
+                f"num_predict={cfg['num_predict']} num_ctx={cfg['num_ctx']} "
+                f"chunk={cfg['chunk_size']}/{cfg['chunk_overlap']}")
+    cand_lines = "\n".join(
+        f"  - [{i}] {'✓' if c['kept'] else '✗'} {c['score']} "
+        f"{c['subject']} cls{c['klass']} p{c['page']} :: \"{_oneline(c['snippet'])}\""
+        for i, c in enumerate(rec["candidates"], 1)
+    ) or "  - (none retrieved)"
     block = (
         f"\n## run — {rec['ts']}  ({rec['endpoint']})\n"
-        f"- **model:** {rec['model']}\n"
+        f"- **config:** {cfg_line}\n"
+        f"- **session:** {rec['session_id']} | rewrite_fired={'yes' if rec['rewrite_fired'] else 'no'} "
+        f"| persona req={'on' if rec['persona_requested'] else 'off'} "
+        f"applied={'yes' if rec['persona_applied'] else 'no'}\n"
         f"- **question:** {rec['question']}\n"
         + (f"- **rewritten:** {rec['rewritten']}\n" if rec["rewritten"] else "")
-        + f"- **timings ms:** rewrite={rec['rewrite_ms']} retrieve={rec['retrieve_ms']} "
-        f"generate={rec['generate_ms']} total={rec['total_ms']}\n"
+        + f"- **timings ms:** ttft={rec['ttft_ms']} rewrite={rec['rewrite_ms']} "
+        f"retrieve={rec['retrieve_ms']} generate={rec['generate_ms']} total={rec['total_ms']}\n"
         f"- **tokens:** prompt={rec['prompt_tokens']} output={rec['output_tokens']} "
         f"tok/s={rec['tok_per_s']} load_ms={rec['load_ms']}\n"
-        f"- **sources:**\n{srcs}\n"
-        f"- **answer:**\n\n{rec['answer']}\n"
+        f"- **retrieval (top_k · ✓kept ✗rejected · top={rec['top_score']}):**\n{cand_lines}\n"
+        + (f"- **error:** {rec['error']}\n" if rec.get("error") else "")
+        + f"- **answer:**\n\n{rec['answer']}\n"
     )
     try:
         with open(settings.eval_path, "a", encoding="utf-8") as f:
             f.write(block)
     except Exception:
         log.warning("could not write eval report to %s", settings.eval_path)
+    try:
+        with open(settings.eval_jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        log.warning("could not write eval jsonl to %s", settings.eval_jsonl_path)
 
 
-def _emit(endpoint: str, question: str, rewritten: str, sources: list[Source],
-          answer: str, timings: "Timings", meta: dict) -> None:
-    """Log a one-line summary to the terminal + append the full record to EVAL.md."""
+def _emit(endpoint: str, question: str, rewritten: str, candidates: list[Source],
+          answer: str, timings: "Timings", meta: dict, *, session_id: str | None = None,
+          persona_requested: bool = False, persona_applied: bool = False,
+          ttft_ms: float | None = None) -> None:
+    """Log a one-line summary to the terminal + append the full record to EVAL.md/.jsonl."""
+    passed = _passed(candidates)
+    top = _top_score(candidates)
     log.info(
-        "%s | rewrite=%.0f retrieve=%.0f generate=%.0f total=%.0f ms | "
-        "prompt_tok=%s out_tok=%s tok/s=%s load=%sms | %d sources",
-        endpoint, timings.rewrite_ms, timings.retrieve_ms, timings.generate_ms,
-        timings.total_ms, meta.get("prompt_tokens"), meta.get("output_tokens"),
-        meta.get("tok_per_s"), meta.get("load_ms"), len(sources),
+        "%s | ttft=%s rewrite=%.0f retrieve=%.0f generate=%.0f total=%.0f ms | "
+        "out_tok=%s tok/s=%s load=%sms | kept=%d/%d top=%s refused=%s persona=%s",
+        endpoint, f"{ttft_ms:.0f}" if ttft_ms is not None else "-",
+        timings.rewrite_ms, timings.retrieve_ms, timings.generate_ms, timings.total_ms,
+        meta.get("output_tokens"), meta.get("tok_per_s"), meta.get("load_ms"),
+        len(passed), len(candidates), top, not passed, persona_applied,
     )
     _log_eval({
         "ts": datetime.now().isoformat(timespec="seconds"),
         "endpoint": endpoint, "model": settings.tutor_model,
+        "config": _config_fingerprint(),
+        "session_id": session_id,
+        "rewrite_fired": rewritten != question,
+        "persona_requested": persona_requested, "persona_applied": persona_applied,
         "question": question,
         "rewritten": rewritten if rewritten != question else None,
+        "ttft_ms": round(ttft_ms, 1) if ttft_ms is not None else None,
         "rewrite_ms": timings.rewrite_ms, "retrieve_ms": timings.retrieve_ms,
         "generate_ms": timings.generate_ms, "total_ms": timings.total_ms,
         "prompt_tokens": meta.get("prompt_tokens"), "output_tokens": meta.get("output_tokens"),
         "tok_per_s": meta.get("tok_per_s"), "load_ms": meta.get("load_ms"),
-        "sources": [s.model_dump() for s in sources], "answer": answer,
+        "top_score": top, "kept_count": len(passed),
+        "candidates": [{**s.model_dump(), "kept": s.kept} for s in candidates],
+        "error": meta.get("error"),
+        "answer": answer,
     })
 
 
@@ -339,14 +433,15 @@ def ask(req: AskRequest) -> AskResponse:
     rewritten = _rewrite(req.question, history)
     t2 = time.perf_counter()
 
-    sources = _retrieve(rewritten)
+    candidates = _retrieve(rewritten)
+    passed = _passed(candidates)
     t3 = time.perf_counter()
 
-    answer, meta = _generate(rewritten, sources)
+    answer, meta = _generate(rewritten, passed)
     t4 = time.perf_counter()
 
     persona_applied = False
-    if req.persona and sources:
+    if req.persona and passed:
         try:
             answer = persona.revoice(answer)
             persona_applied = True
@@ -363,14 +458,17 @@ def ask(req: AskRequest) -> AskResponse:
         generate_ms=round((t4 - t3) * 1000, 1),
         total_ms=round((time.perf_counter() - t0) * 1000, 1),
     )
-    _emit("/ask", req.question, rewritten, sources, answer, timings, meta)
+    _emit("/ask", req.question, rewritten, candidates, answer, timings, meta,
+          session_id=req.session_id, persona_requested=req.persona,
+          persona_applied=persona_applied)
     return AskResponse(
         answer=answer,
-        sources=sources,
+        sources=passed,
         timings=timings,
         model=settings.tutor_model,
         persona_applied=persona_applied,
         rewritten_question=rewritten if rewritten != req.question else None,
+        top_score=_top_score(candidates),
     )
 
 
@@ -393,12 +491,16 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
         t1 = time.perf_counter()
         rewritten = _rewrite(req.question, history)
         t2 = time.perf_counter()
-        sources = _retrieve(rewritten)
+        candidates = _retrieve(rewritten)
+        passed = _passed(candidates)
         t3 = time.perf_counter()
 
-        # 1) meta first — UI renders citations before a single token is generated
+        # 1) meta first — UI renders citations before a single token is generated.
+        #    top_score is included so the client can explain a refusal (how close it was).
         yield _sse("meta", {
-            "sources": [s.model_dump() for s in sources],
+            "sources": _public_sources(candidates),
+            "top_score": _top_score(candidates),
+            "min_score": settings.min_score,
             "rewritten_question": rewritten if rewritten != req.question else None,
             "model": settings.tutor_model,
         })
@@ -406,23 +508,32 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
         # 2) stream the grounded answer token by token
         parts: list[str] = []
         meta: dict = {}
-        if not sources:
+        ttft_ms: float | None = None
+        if not passed:
             parts.append(_NO_SOURCES)
             yield _sse("token", {"text": _NO_SOURCES})
         else:
-            stream = _ollama.chat(
-                model=settings.tutor_model,
-                messages=[{"role": "user", "content": _build_prompt(rewritten, sources)}],
-                options=_OPTS,
-                keep_alive=settings.keep_alive,
-                stream=True,
-            )
-            for chunk in stream:
-                tok = chunk["message"]["content"]
-                if tok:
-                    parts.append(tok)
-                    yield _sse("token", {"text": tok})
-                meta = _meta(chunk)  # final chunk (done=True) carries the metrics
+            try:
+                stream = _ollama.chat(
+                    model=settings.tutor_model,
+                    messages=[{"role": "user", "content": _build_prompt(rewritten, passed)}],
+                    options=_OPTS,
+                    keep_alive=settings.keep_alive,
+                    stream=True,
+                )
+                for chunk in stream:
+                    tok = chunk["message"]["content"]
+                    if tok:
+                        if ttft_ms is None:
+                            ttft_ms = round((time.perf_counter() - t0) * 1000, 1)
+                        parts.append(tok)
+                        yield _sse("token", {"text": tok})
+                    meta = _meta(chunk)  # final chunk (done=True) carries the metrics
+            except Exception as e:
+                log.warning("stream generation failed: %s", e)
+                meta = {"error": str(e)}
+                parts = [f"<ERROR: {e}>"]
+                yield _sse("token", {"text": parts[0]})
         answer = "".join(parts).strip()
         t4 = time.perf_counter()
 
@@ -436,9 +547,12 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
             generate_ms=round((t4 - t3) * 1000, 1),
             total_ms=round((time.perf_counter() - t0) * 1000, 1),
         )
-        _emit("/ask/stream", req.question, rewritten, sources, answer, timings, meta)
+        _emit("/ask/stream", req.question, rewritten, candidates, answer, timings, meta,
+              session_id=req.session_id, persona_requested=req.persona,
+              persona_applied=False, ttft_ms=ttft_ms)
 
-        # 3) done — timings for the same contract as /ask
-        yield _sse("done", {"timings": timings.model_dump(), "meta": meta})
+        # 3) done — timings + persona_applied for the same contract as /ask
+        yield _sse("done", {"timings": timings.model_dump(), "meta": meta,
+                            "persona_applied": False})
 
     return StreamingResponse(gen(), media_type="text/event-stream")

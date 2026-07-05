@@ -48,8 +48,11 @@ class Settings(BaseSettings):
     warmup: bool = True           # preload models on server boot so 1st query isn't cold
 
     # --- Eval report (server appends one block per request; kept local) ---
+    # EVAL.md is the human-readable (Claude-readable) log; EVAL.jsonl is the flat
+    # machine-parseable sidecar for scripted aggregation. Both gitignored.
     eval_log: bool = True
     eval_path: Path = ROOT / "EVAL.md"
+    eval_jsonl_path: Path = ROOT / "EVAL.jsonl"
 
     def ensure_dirs(self) -> None:
         """Make the data dirs exist so a fresh clone works with no setup."""
