@@ -33,6 +33,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from khoji import persona
+from khoji import rerank as reranker
 from khoji.config import settings
 
 # Dedicated logger so per-request timing lines show in the terminal regardless of
@@ -54,10 +55,13 @@ class Source(BaseModel):
     chapter: str | None = None
     page: int | None = None
     snippet: str
-    score: float
-    # internal: passed the min_score gate. exclude=True keeps it out of the public
-    # contract (API/SSE); it's re-added explicitly only in the EVAL record.
-    kept: bool = Field(default=True, exclude=True)
+    score: float | None = None          # cosine similarity 0..1; None for BM25-only candidates
+    rerank_score: float | None = None   # cross-encoder relevance (the ordering/gate signal)
+    # internal fields kept out of the public contract (exclude=True); re-added
+    # explicitly only in the EVAL record.
+    kept: bool = Field(default=True, exclude=True)          # passed the gate → sent to the LLM
+    rrf: float = Field(default=0.0, exclude=True)           # fused reciprocal-rank score
+    matched: str = Field(default="dense", exclude=True)     # dense | bm25 | dense+bm25
 
 
 class Timings(BaseModel):
@@ -107,6 +111,13 @@ _FOLLOWUP_START = re.compile(r"^(and|so|but|also|what about|how about|why|why no
 SESSIONS: dict[str, list[dict]] = defaultdict(list)
 _MAX_HISTORY = 6
 
+# BM25 lexical index — derived from Chroma at startup (Chroma stays the single source
+# of truth; no new persisted index). Rebuilt on boot, like SESSIONS. None => hybrid off.
+_BM25 = None
+_BM25_IDS: list[str] = []
+_BM25_DOCS: list[str] = []
+_BM25_METAS: list[dict] = []
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Readiness log + optional warm-up so the first real query isn't cold-loaded.
@@ -115,6 +126,8 @@ async def lifespan(app: FastAPI):
         log.info("corpus ready: %d chunks in '%s'", n, settings.collection)
     else:
         log.warning("no corpus ingested — run `python -m khoji.ingest` before serving")
+    _build_bm25_index()
+    reranker.warmup()
     if settings.warmup and n:
         try:
             _ollama.chat(model=settings.tutor_model,
@@ -175,6 +188,13 @@ def _config_fingerprint() -> dict:
         "space": space,
         "top_k": settings.top_k,
         "min_score": settings.min_score,
+        "hybrid": settings.hybrid and _BM25 is not None,
+        "pool_size": settings.pool_size,
+        "rrf_k": settings.rrf_k,
+        "rerank": settings.rerank,
+        "rerank_model": settings.rerank_model,
+        "min_rerank_score": settings.min_rerank_score,
+        "query_prefix": settings.query_prefix,
         "num_predict": settings.num_predict,
         "num_ctx": settings.num_ctx,
         "chunk_size": settings.chunk_size,
@@ -237,44 +257,133 @@ def _rewrite(question: str, history: list[dict]) -> str:
     return out
 
 
-def _retrieve(question: str) -> list[Source]:
-    """Return ALL top-k candidates (Chroma-sorted), each flagged kept/rejected.
+def _tokenize(text: str) -> list[str]:
+    """Cheap lexical tokens for BM25 — lowercased alphanumerics (keeps '1885', 'na')."""
+    return re.findall(r"[a-z0-9]+", (text or "").lower())
 
-    The relevance gate lives in the `kept` flag (score >= min_score), NOT in the
-    return value: callers use `_passed()` for generation/response, but the full
-    list is logged so refusals aren't a black box (we can see the near-misses).
+
+def _build_bm25_index() -> None:
+    """Build the in-memory BM25 index from the whole Chroma corpus. Best-effort:
+    if rank_bm25 is missing or the corpus is empty, hybrid silently no-ops (dense only)."""
+    global _BM25, _BM25_IDS, _BM25_DOCS, _BM25_METAS
+    _BM25 = None
+    if not settings.hybrid:
+        return
+    try:
+        from rank_bm25 import BM25Okapi
+    except Exception as e:
+        log.warning("bm25 disabled (rank_bm25 not installed): %s", e)
+        return
+    try:
+        got = _chroma.get_collection(settings.collection).get(include=["documents", "metadatas"])
+    except Exception:
+        return
+    ids = got.get("ids") or []
+    docs = got.get("documents") or []
+    metas = got.get("metadatas") or []
+    if not docs:
+        return
+    _BM25_IDS, _BM25_DOCS, _BM25_METAS = ids, docs, metas
+    _BM25 = BM25Okapi([_tokenize(d) for d in docs])
+    log.info("bm25 index built: %d docs", len(docs))
+
+
+def _retrieve(question: str) -> list[Source]:
+    """Hybrid retrieval: dense (cosine, nomic search_query prefix) ∪ BM25, fused by RRF.
+
+    The relevance gate is calibrated on COSINE (refuse the whole query if the best cosine
+    < min_score); within an answerable query, RRF ordering lets BM25 promote the right
+    entity/number chunk that cosine alone buried (the Bohr↔Rutherford fix). Callers use
+    `_passed()` (the top_k) to generate; the full fused pool is returned so it's all logged.
     """
     try:
         collection = _chroma.get_collection(settings.collection)
     except Exception:
         return []  # nothing ingested yet
-    res = collection.query(query_embeddings=[_embed(question)], n_results=settings.top_k)
-    docs = res.get("documents", [[]])[0]
-    metas = res.get("metadatas", [[]])[0]
-    dists = res.get("distances", [[]])[0]
-    scored: list[Source] = []
-    for doc, meta, dist in zip(docs, metas, dists):
-        meta = meta or {}
-        score = round(1.0 - float(dist), 4)  # cosine distance -> similarity 0..1
-        scored.append(
-            Source(
-                subject=meta.get("subject"),
-                klass=meta.get("klass"),
-                chapter=meta.get("chapter"),
-                page=meta.get("page"),
-                snippet=doc[:300],
-                score=score,
-                kept=score >= settings.min_score,
-            )
-        )
-    if scored and not any(s.kept for s in scored):
-        log.info("retrieval below threshold (top=%.3f < %.2f) — refusing",
-                 max(s.score for s in scored), settings.min_score)
-    return scored
+
+    # --- dense (cosine), query embedded with the nomic search_query prefix ---
+    res = collection.query(
+        query_embeddings=[_embed(settings.query_prefix + question)],
+        n_results=settings.pool_size,
+    )
+    ids = (res.get("ids") or [[]])[0]
+    docs = (res.get("documents") or [[]])[0]
+    metas = (res.get("metadatas") or [[]])[0]
+    dists = (res.get("distances") or [[]])[0]
+
+    pool: dict[str, dict] = {}
+    for rank, (cid, doc, meta, dist) in enumerate(zip(ids, docs, metas, dists)):
+        pool[cid] = {"doc": doc, "meta": meta or {}, "cosine": round(1.0 - float(dist), 4),
+                     "dense_rank": rank, "bm25_rank": None}
+
+    # --- BM25 (lexical), union into the pool ---
+    if settings.hybrid and _BM25 is not None:
+        scores = _BM25.get_scores(_tokenize(question))
+        order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        for rank, i in enumerate(order[:settings.pool_size]):
+            if scores[i] <= 0:
+                continue
+            cid = _BM25_IDS[i]
+            if cid in pool:
+                pool[cid]["bm25_rank"] = rank
+            else:
+                pool[cid] = {"doc": _BM25_DOCS[i], "meta": _BM25_METAS[i] or {},
+                             "cosine": None, "dense_rank": None, "bm25_rank": rank}
+
+    # --- reciprocal-rank fusion ---
+    k = settings.rrf_k
+    def _rrf(e: dict) -> float:
+        s = 0.0
+        if e["dense_rank"] is not None:
+            s += 1.0 / (k + e["dense_rank"])
+        if e["bm25_rank"] is not None:
+            s += 1.0 / (k + e["bm25_rank"])
+        return s
+
+    entries = sorted(pool.values(), key=_rrf, reverse=True)
+    for e in entries:
+        e["rrf"] = round(_rrf(e), 6)
+
+    # --- precision stage: cross-encoder reranks the fused pool (None => fall back to RRF) ---
+    rr = reranker.rerank(question, [e["doc"] for e in entries]) if settings.rerank else None
+    if rr is not None:
+        for e, s in zip(entries, rr):
+            e["rerank"] = s
+        entries.sort(key=lambda e: e["rerank"], reverse=True)
+        top = entries[0]["rerank"] if entries else None
+        answerable = top is not None and top >= settings.min_rerank_score
+        # Keep the full top_k of reranked chunks — a tutor needs coherent context for broad
+        # conceptual questions. Distractor rejection is the min_rerank_score gate's job (a
+        # true distractor scores far below the floor); a gap-cutoff here only starved context.
+        kept_ids = {id(e) for e in entries[:settings.top_k]} if answerable else set()
+        floor_label, floor_top, floor_min = "rerank", top, settings.min_rerank_score
+    else:
+        for e in entries:
+            e["rerank"] = None
+        best_cos = max((e["cosine"] for e in entries if e["cosine"] is not None), default=None)
+        answerable = best_cos is not None and best_cos >= settings.min_score
+        kept_ids = {id(e) for e in entries[:settings.top_k]} if answerable else set()
+        floor_label, floor_top, floor_min = "cosine", best_cos, settings.min_score
+
+    if entries and not answerable:
+        log.info("retrieval below %s floor (top=%s < %s) — refusing",
+                 floor_label, floor_top, floor_min)
+
+    out: list[Source] = []
+    for e in entries:
+        matched = ("dense+bm25" if e["dense_rank"] is not None and e["bm25_rank"] is not None
+                   else "dense" if e["dense_rank"] is not None else "bm25")
+        out.append(Source(
+            subject=e["meta"].get("subject"), klass=e["meta"].get("klass"),
+            chapter=e["meta"].get("chapter"), page=e["meta"].get("page"),
+            snippet=e["doc"][:300], score=e["cosine"], rerank_score=e["rerank"],
+            kept=id(e) in kept_ids, rrf=e["rrf"], matched=matched,
+        ))
+    return out
 
 
 def _passed(candidates: list[Source]) -> list[Source]:
-    """The gate: candidates that cleared min_score (used for generation + citation)."""
+    """The gate: candidates kept for generation + citation (top_k by RRF, non-refused)."""
     return [s for s in candidates if s.kept]
 
 
@@ -284,8 +393,16 @@ def _public_sources(candidates: list[Source]) -> list[dict]:
 
 
 def _top_score(candidates: list[Source]) -> float | None:
-    """Best retrieval score seen (even if nothing cleared the gate)."""
-    return max((s.score for s in candidates), default=None)
+    """Best relevance seen — rerank score when reranking is active, else cosine (None-safe)."""
+    rr = [s.rerank_score for s in candidates if s.rerank_score is not None]
+    if rr:
+        return max(rr)
+    return max((s.score for s in candidates if s.score is not None), default=None)
+
+
+def _active_floor() -> float:
+    """The gate the client shows 'how close' against — the rerank floor when reranking."""
+    return settings.min_rerank_score if settings.rerank else settings.min_score
 
 
 # Shown when retrieval comes back empty — we refuse to guess rather than hallucinate.
@@ -347,12 +464,15 @@ def _log_eval(rec: dict) -> None:
         return
     cfg = rec["config"]
     cfg_line = (f"tutor={cfg['tutor_model']} embed={cfg['embed_model']} space={cfg['space']} "
+                f"hybrid={cfg['hybrid']} pool={cfg['pool_size']} rrf_k={cfg['rrf_k']} "
+                f"rerank={cfg['rerank']}/{cfg['rerank_model']} min_rr={cfg['min_rerank_score']} "
                 f"top_k={cfg['top_k']} min_score={cfg['min_score']} "
                 f"num_predict={cfg['num_predict']} num_ctx={cfg['num_ctx']} "
                 f"chunk={cfg['chunk_size']}/{cfg['chunk_overlap']}")
     cand_lines = "\n".join(
-        f"  - [{i}] {'✓' if c['kept'] else '✗'} {c['score']} "
-        f"{c['subject']} cls{c['klass']} p{c['page']} :: \"{_oneline(c['snippet'])}\""
+        f"  - [{i}] {'✓' if c['kept'] else '✗'} rr={c.get('rerank_score')} cos={c['score']} "
+        f"rrf={c.get('rrf')} [{c.get('matched')}] {c['subject']} cls{c['klass']} p{c['page']} "
+        f":: \"{_oneline(c['snippet'])}\""
         for i, c in enumerate(rec["candidates"], 1)
     ) or "  - (none retrieved)"
     block = (
@@ -413,7 +533,8 @@ def _emit(endpoint: str, question: str, rewritten: str, candidates: list[Source]
         "prompt_tokens": meta.get("prompt_tokens"), "output_tokens": meta.get("output_tokens"),
         "tok_per_s": meta.get("tok_per_s"), "load_ms": meta.get("load_ms"),
         "top_score": top, "kept_count": len(passed),
-        "candidates": [{**s.model_dump(), "kept": s.kept} for s in candidates],
+        "candidates": [{**s.model_dump(), "kept": s.kept, "rrf": s.rrf, "matched": s.matched}
+                       for s in candidates],
         "error": meta.get("error"),
         "answer": answer,
     })
@@ -469,6 +590,7 @@ def ask(req: AskRequest) -> AskResponse:
         persona_applied=persona_applied,
         rewritten_question=rewritten if rewritten != req.question else None,
         top_score=_top_score(candidates),
+        min_score=_active_floor(),
     )
 
 
@@ -500,7 +622,7 @@ def ask_stream(req: AskRequest) -> StreamingResponse:
         yield _sse("meta", {
             "sources": _public_sources(candidates),
             "top_score": _top_score(candidates),
-            "min_score": settings.min_score,
+            "min_score": _active_floor(),
             "rewritten_question": rewritten if rewritten != req.question else None,
             "model": settings.tutor_model,
         })

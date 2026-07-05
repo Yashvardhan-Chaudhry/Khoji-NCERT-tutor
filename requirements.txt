@@ -17,3 +17,9 @@ pymupdf
 # Vector store + local model client (used directly on the serving side)
 chromadb
 ollama
+
+# Hybrid retrieval — lexical BM25 fused with dense cosine (pure-python, offline)
+rank-bm25
+
+# Cross-encoder reranker — FlashRank (ONNX via onnxruntime; no torch). Model fetched once.
+flashrank

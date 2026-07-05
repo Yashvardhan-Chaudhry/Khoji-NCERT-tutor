@@ -19,6 +19,7 @@ ingest for the same PDF appends; wipe data/chroma to rebuild clean.
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 import chromadb
@@ -30,8 +31,52 @@ from langchain_ollama import OllamaEmbeddings
 from khoji.config import settings
 
 
+def _degarble(text: str) -> str:
+    """Collapse consecutive repeated tokens / short phrases from PDF extraction.
+
+    NCERT's decorative drop-caps and boxed headings come out as runs like
+    "BOHR OHR OHR OHR'S MODEL MODEL MODEL" or "in Different Orbits (Shells)?" ×5.
+    We collapse any phrase of 1..6 words that repeats immediately, keeping one copy.
+    Token-based (not regex) so there's no catastrophic-backtracking risk.
+    """
+    words = text.split()
+    out: list[str] = []
+    i, n = 0, len(words)
+    while i < n:
+        collapsed = False
+        for length in range(1, min(6, (n - i) // 2) + 1):
+            phrase = words[i:i + length]
+            reps = 1
+            while words[i + reps * length: i + (reps + 1) * length] == phrase:
+                reps += 1
+            if reps > 1:
+                out.extend(phrase)          # keep a single copy
+                i += reps * length
+                collapsed = True
+                break
+        if not collapsed:
+            out.append(words[i])
+            i += 1
+    cleaned = " ".join(out)
+    return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
+
+class _PrefixedOllamaEmbeddings(OllamaEmbeddings):
+    """nomic-embed-text needs task prefixes. Documents are embedded with the
+    'search_document: ' prefix, but the STORED chunk text stays original — Chroma
+    stores the page_content it passes in and embeds the (prefixed) copy we return,
+    so the prefix never pollutes the retrieved snippet/context.
+    """
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return super().embed_documents([settings.doc_prefix + t for t in texts])
+
+    def embed_query(self, text: str) -> list[float]:
+        return super().embed_query(settings.query_prefix + text)
+
+
 def _embeddings() -> OllamaEmbeddings:
-    return OllamaEmbeddings(model=settings.embed_model, base_url=settings.ollama_host)
+    return _PrefixedOllamaEmbeddings(model=settings.embed_model, base_url=settings.ollama_host)
 
 
 def ingest_pdf(pdf: Path, subject: str, klass: str, chapter: str | None = None,
@@ -60,6 +105,12 @@ def ingest_pdf(pdf: Path, subject: str, klass: str, chapter: str | None = None,
 
     # One Document per page; PyMuPDF fills metadata['page'] (0-indexed) + 'source'.
     pages = PyMuPDFLoader(str(pdf)).load()
+
+    # Light de-garble: NCERT PDFs extract decorative headers as repeated junk
+    # ("OHR OHR OHR", "(Shells)? (Shells)?", "4.2.3 4.2.3 4.2.3"), which buries the
+    # real facts and hurts both embedding and the model. Collapse the repeats.
+    for p in pages:
+        p.page_content = _degarble(p.page_content)
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.chunk_size,

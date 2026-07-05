@@ -39,7 +39,23 @@ class Settings(BaseSettings):
     top_k: int = 3                # 3 keeps prompts short + answers focused (5 diluted quality)
     chunk_size: int = 1000
     chunk_overlap: int = 150
-    min_score: float = 0.55       # cosine floor; tunable. atom eval: in-topic ~0.73, off-topic ~0.54
+    min_score: float = 0.55       # cosine floor; tunable. RE-TUNE after prefixes shift the scale
+
+    # --- Hybrid retrieval: dense (cosine) ∪ BM25 (lexical) → RRF pool → cross-encoder rerank ---
+    hybrid: bool = True
+    pool_size: int = 10           # dense + BM25 candidates fetched before fusion
+    rrf_k: int = 60               # reciprocal-rank-fusion constant
+
+    # Cross-encoder reranker over the fused pool — the precision stage (Bohr↔Rutherford fix).
+    rerank: bool = True
+    rerank_backend: str = "flashrank"                 # swappable; flashrank = ONNX, torch-free
+    rerank_model: str = "ms-marco-MiniLM-L-12-v2"     # ~35MB; bge-reranker-v2-m3 = heavier upgrade
+    rerank_cache_dir: Path = ROOT / "data" / "rerank"  # model cache (gitignored under data/)
+    min_rerank_score: float = 0.30    # refuse floor on rerank score — PLACEHOLDER, tune via EVAL
+    # nomic-embed-text task prefixes — REQUIRED for good retrieval (asymmetric
+    # query/document encoding). Applied to queries at serve time, documents at ingest.
+    query_prefix: str = "search_query: "
+    doc_prefix: str = "search_document: "
 
     # --- Inference latency knobs (this box is CPU-only + RAM-starved) ---
     num_predict: int = 220        # hard ceiling on answer tokens (~120 words + citations)
