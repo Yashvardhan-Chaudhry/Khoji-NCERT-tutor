@@ -1,9 +1,9 @@
 # --- Dynamic working docs: kept local, not published ---
-# These are the live control/decision docs for the author + Claude. A polished
-# public claude.md is added later, deliberately.
-claude.md
-DECISIONS.md
-IMPROVEMENTS.md
+# The live control/decision docs for the author + Claude. Locally renamed with a
+# `khoji_` prefix for easier traversal — the glob keeps ALL such working docs out
+# of the public repo (guards against an accidental `git add -A`). A polished public
+# claude.md is added later, deliberately.
+khoji_*.md
 EVAL.md
 EVAL.jsonl
 docs/
